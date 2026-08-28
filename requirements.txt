@@ -1,0 +1,8 @@
+pandas
+nflreadpy
+scikit-learn
+xgboost
+requests
+python-dotenv
+ipykernel
+pyarrow

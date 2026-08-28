@@ -1,0 +1,33 @@
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables / secrets
+.env
+
+# SQLite database
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# VS Code settings (optional — some people keep this tracked)
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
