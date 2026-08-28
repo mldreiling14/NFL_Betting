@@ -15,4 +15,4 @@ def fetch_and_save_schedules(seasons, db_path="data/nfl.db"):
     print(f"Saved {len(df)} games to {db_path}")
 
 if __name__ == "__main__":
-    fetch_and_save_schedules(seasons=list(range(2015, 2024)))
+    fetch_and_save_schedules(seasons=list(range(2015, 2026)))

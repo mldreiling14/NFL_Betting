@@ -351,51 +351,67 @@ def add_injury_features(df_full, injuries, rb_stats, wrte_stats, window=5):
     return df_full
 
 
-def add_defense_features(df_full, player_stats, window=5):
+def add_defense_allowed_features(df_full, team_stats, window=5):
     """
-    Adds rolling team-level defensive performance features (sacks,
-    interceptions, tackles for loss, QB hits, forced fumbles, passes
-    defended) for both home and away teams. Aggregates all defensive
-    players on a team into one team-level signal per game, then
-    computes a rolling average over that team's prior games (no
-    leakage), reset at each season boundary.
+    Adds rolling team-level defensive features based on what a team's
+    defense ALLOWED (opponent's own offensive EPA/yards that game) and
+    takeaways forced (INTs + fumble recoveries combined). This is a
+    richer signal than raw counting stats like sacks, since it reflects
+    what the defense actually gave up rather than isolated events.
 
-    player_stats must include: game_id, season, week, team, position,
-    def_sacks, def_interceptions, def_tackles_for_loss, def_qb_hits,
-    def_fumbles_forced, def_pass_defended
+    team_stats must include: game_id, season, week, team, opponent_team,
+    passing_epa, rushing_epa, passing_yards, rushing_yards,
+    def_interceptions, fumble_recovery_opp
+
+    Note: team_stats already uses current franchise codes (LAC/LA/LV),
+    so it merges directly against df_full's standardized team columns.
     """
 
-    def_positions = ['DE', 'DT', 'DL', 'NT', 'LB', 'ILB', 'OLB', 'MLB', 'CB', 'DB', 'S', 'SAF', 'FS']
-    stat_cols = ['def_sacks', 'def_interceptions', 'def_tackles_for_loss',
-                 'def_qb_hits', 'def_fumbles_forced', 'def_pass_defended']
+    team_stats = team_stats[['game_id', 'season', 'week', 'team', 'opponent_team',
+                              'passing_epa', 'rushing_epa', 'passing_yards', 'rushing_yards',
+                              'def_interceptions', 'fumble_recovery_opp']].copy()
 
-    def_stats = player_stats[player_stats['position'].isin(def_positions)].copy()
-    def_stats = def_stats[['game_id', 'season', 'week', 'team'] + stat_cols]
+    opponent_offense = team_stats[['game_id', 'team', 'passing_epa', 'rushing_epa',
+                                    'passing_yards', 'rushing_yards']].rename(
+        columns={'team': 'opponent_team', 'passing_epa': 'opp_passing_epa',
+                 'rushing_epa': 'opp_rushing_epa', 'passing_yards': 'opp_passing_yards',
+                 'rushing_yards': 'opp_rushing_yards'}
+    )
 
-    def_team_game = def_stats.groupby(['team', 'game_id', 'season', 'week'], as_index=False).sum()
-    def_team_game = def_team_game.sort_values(['team', 'season', 'week']).reset_index(drop=True)
+    team_stats = team_stats.merge(opponent_offense, on=['game_id', 'opponent_team'], how='left')
 
-    for col in stat_cols:
-        def_team_game[f'recent_{col}'] = (
-            def_team_game.groupby(['team', 'season'])[col]
+    team_stats['epa_allowed'] = team_stats['opp_passing_epa'] + team_stats['opp_rushing_epa']
+    team_stats['yards_allowed'] = team_stats['opp_passing_yards'] + team_stats['opp_rushing_yards']
+    team_stats['takeaways'] = team_stats['def_interceptions'] + team_stats['fumble_recovery_opp']
+
+    team_stats = team_stats.sort_values(['team', 'season', 'week']).reset_index(drop=True)
+    for col in ['epa_allowed', 'yards_allowed', 'takeaways']:
+        team_stats[f'recent_{col}'] = (
+            team_stats.groupby(['team', 'season'])[col]
             .transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
         )
 
     df_full = standardize_team_codes(df_full)
 
-    def_recent_cols = ['team', 'game_id'] + [f'recent_{c}' for c in stat_cols]
-    def_recent = def_team_game[def_recent_cols]
+    def_allowed_recent = team_stats[['team', 'game_id', 'recent_epa_allowed',
+                                       'recent_yards_allowed', 'recent_takeaways']]
 
-    home_def = def_recent.rename(columns={
+    home_def = def_allowed_recent.rename(columns={
         'team': 'home_team_std',
-        **{f'recent_{c}': f'home_def_recent_{c}' for c in stat_cols}
+        'recent_epa_allowed': 'home_epa_allowed_recent',
+        'recent_yards_allowed': 'home_yards_allowed_recent',
+        'recent_takeaways': 'home_takeaways_recent'
     })
-    away_def = def_recent.rename(columns={
+    away_def = def_allowed_recent.rename(columns={
         'team': 'away_team_std',
-        **{f'recent_{c}': f'away_def_recent_{c}' for c in stat_cols}
+        'recent_epa_allowed': 'away_epa_allowed_recent',
+        'recent_yards_allowed': 'away_yards_allowed_recent',
+        'recent_takeaways': 'away_takeaways_recent'
     })
 
-    df_full = df_full.drop(columns=[c for c in df_full.columns if 'def_recent' in c], errors='ignore')
+    df_full = df_full.drop(columns=[c for c in df_full.columns if
+                                     'epa_allowed_recent' in c or 'yards_allowed_recent' in c or 'takeaways_recent' in c],
+                            errors='ignore')
     df_full = df_full.merge(home_def, on=['home_team_std', 'game_id'], how='left')
     df_full = df_full.merge(away_def, on=['away_team_std', 'game_id'], how='left')
 
@@ -476,5 +492,308 @@ def add_coach_features(df_full, window=5):
     df_full = df_full.merge(h2h_results, on='game_id', how='left')
     df_full['home_coach_h2h_wins'] = df_full['home_coach_h2h_wins'].fillna(0.5)
     df_full['h2h_games_played'] = df_full['h2h_games_played'].fillna(0)
+
+    return df_full
+
+
+def add_elo_features(df_full, k_factor=20, home_advantage=65, revert_fraction=1/3, initial_rating=1500):
+    """
+    Adds Elo ratings for both home and away teams, reflecting each
+    team's overall strength entering this specific game (accounts
+    for strength of opponent, unlike simple win %). Ratings partially
+    revert toward league average (1500) at the start of each season
+    to account for roster turnover, then evolve game-by-game based
+    on actual vs. expected outcomes.
+    """
+
+    df_full = standardize_team_codes(df_full)
+
+    games = df_full[['game_id', 'season', 'week', 'gameday', 'home_team_std', 'away_team_std', 'home_win']].copy()
+    games = games.sort_values(['season', 'gameday']).reset_index(drop=True)
+
+    all_teams = set(games['home_team_std']).union(set(games['away_team_std']))
+    elo = {team: initial_rating for team in all_teams}
+
+    home_elo_pre = []
+    away_elo_pre = []
+    current_season = None
+
+    for idx, row in games.iterrows():
+        if current_season is not None and row['season'] != current_season:
+            for team in elo:
+                elo[team] = elo[team] * (1 - revert_fraction) + initial_rating * revert_fraction
+        current_season = row['season']
+
+        home_team = row['home_team_std']
+        away_team = row['away_team_std']
+
+        home_elo_pre.append(elo[home_team])
+        away_elo_pre.append(elo[away_team])
+
+        elo_diff = (elo[home_team] + home_advantage) - elo[away_team]
+        expected_home = 1 / (1 + 10 ** (-elo_diff / 400))
+        actual_home = row['home_win']
+
+        elo[home_team] += k_factor * (actual_home - expected_home)
+        elo[away_team] += k_factor * ((1 - actual_home) - (1 - expected_home))
+
+    games['home_elo_pre'] = home_elo_pre
+    games['away_elo_pre'] = away_elo_pre
+
+    elo_merge = games[['game_id', 'home_elo_pre', 'away_elo_pre']]
+    df_full = df_full.drop(columns=['home_elo_pre', 'away_elo_pre'], errors='ignore')
+    df_full = df_full.merge(elo_merge, on='game_id', how='left')
+
+    return df_full
+
+def add_rest_advantage(df_full):
+    """
+    Adds rest_advantage: the difference in days of rest between the
+    home and away team (positive = home team had more rest). Derived
+    directly from home_rest/away_rest already present in the schedule
+    data — a scheduling/fatigue signal distinct from team performance.
+    """
+    df_full = df_full.copy()
+    df_full['rest_advantage'] = df_full['home_rest'] - df_full['away_rest']
+
+    return df_full
+
+def add_oline_features(df_full, oline_stats, pressure_stats):
+    """
+    Adds O-line/pass-protection features for both home and away teams:
+    1) Sack rate (sacks per dropback, from load_team_stats — available
+       full 2015+ range).
+    2) QB pressure rate (from PFR advanced stats, load_pfr_advstats —
+       only available 2018+; earlier seasons will show NaN and should
+       be mean-imputed at modeling time).
+
+    IMPORTANT: pressure_stats uses PFR's team codes, which reflect the
+    ACTUAL code at the time (e.g. OAK through 2019, LV from 2020) —
+    the opposite convention from load_team_stats, which backfills to
+    CURRENT codes for all seasons. This function merges oline_stats
+    against home_team_std/away_team_std (standardized), but merges
+    pressure_stats against the raw home_team/away_team. Do not "fix"
+    this to be consistent without re-verifying against real data.
+
+    oline_stats must include: game_id, season, week, team, attempts,
+    sacks_suffered
+    pressure_stats must include: game_id, season, week, team,
+    times_pressured_pct
+    """
+
+    # --- Sack rate (season-aware rolling, standardized team codes) ---
+    oline_stats = oline_stats.copy()
+    oline_stats['sack_rate'] = oline_stats['sacks_suffered'] / (oline_stats['attempts'] + oline_stats['sacks_suffered'])
+    oline_stats = oline_stats.sort_values(['team', 'season', 'week']).reset_index(drop=True)
+    oline_stats['recent_sack_rate'] = (
+        oline_stats.groupby(['team', 'season'])['sack_rate']
+        .transform(lambda x: x.shift(1).rolling(window=5, min_periods=1).mean())
+    )
+
+    df_full = standardize_team_codes(df_full)
+
+    sack_rate_recent = oline_stats[['team', 'game_id', 'recent_sack_rate']]
+    home_sr = sack_rate_recent.rename(columns={'team': 'home_team_std', 'recent_sack_rate': 'home_sack_rate_recent'})
+    away_sr = sack_rate_recent.rename(columns={'team': 'away_team_std', 'recent_sack_rate': 'away_sack_rate_recent'})
+
+    df_full = df_full.drop(columns=['home_sack_rate_recent', 'away_sack_rate_recent'], errors='ignore')
+    df_full = df_full.merge(home_sr, on=['home_team_std', 'game_id'], how='left')
+    df_full = df_full.merge(away_sr, on=['away_team_std', 'game_id'], how='left')
+
+    # --- Pressure rate (season-aware rolling, RAW team codes - see docstring) ---
+    pressure_stats = pressure_stats.copy()
+    pressure_team_game = pressure_stats.groupby(['team', 'game_id', 'season', 'week'], as_index=False).mean(numeric_only=True)
+    pressure_team_game = pressure_team_game.sort_values(['team', 'season', 'week']).reset_index(drop=True)
+    pressure_team_game['recent_pressure_pct'] = (
+        pressure_team_game.groupby(['team', 'season'])['times_pressured_pct']
+        .transform(lambda x: x.shift(1).rolling(window=5, min_periods=1).mean())
+    )
+
+    pressure_recent = pressure_team_game[['team', 'game_id', 'recent_pressure_pct']]
+    home_press = pressure_recent.rename(columns={'team': 'home_team', 'recent_pressure_pct': 'home_pressure_pct_recent'})
+    away_press = pressure_recent.rename(columns={'team': 'away_team', 'recent_pressure_pct': 'away_pressure_pct_recent'})
+
+    df_full = df_full.drop(columns=['home_pressure_pct_recent', 'away_pressure_pct_recent'], errors='ignore')
+    df_full = df_full.merge(home_press, on=['home_team', 'game_id'], how='left')
+    df_full = df_full.merge(away_press, on=['away_team', 'game_id'], how='left')
+
+    return df_full
+
+def add_db_wr_matchup_features(df_full, player_stats, snaps_full, crosswalk, physical, adv_def_full, window=5):
+    """
+    Adds an approximated WR-vs-CB size and coverage matchup feature:
+    for each team's primary WR (highest recent snap share among WRs),
+    compares height/weight against the OPPOSING team's primary CB
+    (highest recent snap share among CBs that game), plus that CB's
+    real recent coverage performance (completion %, passer rating
+    allowed).
+
+    IMPORTANT CAVEAT: NFL data does not publish which specific CB
+    covers which specific WR on any given play. This is an
+    approximation ("team's best WR" vs "opponent's most-used CB"),
+    not a guaranteed real matchup.
+
+    IMPORTANT BUG HISTORY: the CB identification step MUST use an
+    INNER merge (not left) between adv_def_full and cb_snaps. A left
+    merge lets non-CB defenders (who happened to record some pass-
+    defense stat that game, e.g. a DE or LB) enter the "primary CB"
+    candidate pool, and they can incorrectly win the selection when
+    multiple players tie at NaN (e.g. every Week 1, before any rolling
+    history exists). This produced a real bug (a 300lb "cornerback"
+    who was actually a defensive end) that was caught via a physical-
+    plausibility sanity check, not by the merge logic itself failing.
+
+    Only available for 2018+ (PFR advanced stats limitation) — earlier
+    seasons will show NaN and should be mean-imputed at modeling time.
+
+    player_stats must include: player_id, game_id, season, week, team,
+    position, targets
+    snaps_full must include: pfr_player_id, game_id, team, position,
+    offense_pct, defense_pct
+    crosswalk must include: player_id, pfr_player_id
+    physical must include: pfr_player_id, height, weight
+    adv_def_full must include: game_id, season, week, team,
+    pfr_player_id, def_completion_pct, def_passer_rating_allowed
+    (team column follows PFR's actual-code-at-the-time convention,
+    NOT the standardized/current-code convention — merge against
+    df_full's raw home_team/away_team, not home_team_std/away_team_std)
+    """
+
+    # --- Primary CB per team/game (INNER merge is the critical fix) ---
+    cb_snaps = snaps_full[snaps_full['position'] == 'CB'][['pfr_player_id', 'game_id', 'team', 'defense_pct']]
+
+    cb_stats = adv_def_full.merge(
+        cb_snaps[['pfr_player_id', 'game_id', 'defense_pct']],
+        on=['pfr_player_id', 'game_id'], how='inner'  # INNER, not left - see docstring
+    )
+
+    cb_stats = cb_stats.sort_values(['pfr_player_id', 'season', 'week']).reset_index(drop=True)
+    cb_stats['recent_defense_pct'] = (
+        cb_stats.groupby(['pfr_player_id', 'season'])['defense_pct']
+        .transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
+    )
+    for col in ['def_completion_pct', 'def_passer_rating_allowed']:
+        cb_stats[f'recent_{col}'] = (
+            cb_stats.groupby(['pfr_player_id', 'season'])[col]
+            .transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
+        )
+
+    primary_cb = (
+        cb_stats.sort_values('recent_defense_pct', ascending=False)
+        .groupby(['team', 'game_id'], as_index=False)
+        .first()[['team', 'game_id', 'season', 'week', 'pfr_player_id',
+                  'recent_def_completion_pct', 'recent_def_passer_rating_allowed']]
+    )
+    primary_cb = primary_cb.merge(physical, on='pfr_player_id', how='left')
+
+    # --- Primary WR per team/game ---
+    wr_snaps = snaps_full[snaps_full['position'] == 'WR'][['pfr_player_id', 'game_id', 'team', 'offense_pct']]
+
+    wr_targets = player_stats[player_stats['position'] == 'WR'][
+        ['player_id', 'game_id', 'season', 'week', 'team', 'targets']].copy()
+    wr_targets = wr_targets.merge(crosswalk, on='player_id', how='left')
+    wr_targets = wr_targets.merge(
+        wr_snaps[['pfr_player_id', 'game_id', 'offense_pct']], on=['pfr_player_id', 'game_id'], how='left')
+
+    wr_targets = wr_targets.sort_values(['pfr_player_id', 'season', 'week']).reset_index(drop=True)
+    wr_targets['recent_offense_pct'] = (
+        wr_targets.groupby(['pfr_player_id', 'season'])['offense_pct']
+        .transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
+    )
+
+    primary_wr = (
+        wr_targets.sort_values('recent_offense_pct', ascending=False)
+        .groupby(['team', 'game_id'], as_index=False)
+        .first()[['team', 'game_id', 'season', 'week', 'pfr_player_id']]
+    )
+    primary_wr = primary_wr.merge(physical, on='pfr_player_id', how='left')
+
+    # --- Match each WR against the OPPOSING team's primary CB ---
+    wr_for_matchup = primary_wr[['team', 'game_id', 'season', 'height', 'weight']].rename(
+        columns={'height': 'wr_height', 'weight': 'wr_weight'})
+
+    cb_for_matchup = primary_cb[['team', 'game_id', 'height', 'weight',
+                                   'recent_def_completion_pct', 'recent_def_passer_rating_allowed']].rename(
+        columns={'team': 'opponent_team', 'height': 'cb_height', 'weight': 'cb_weight'})
+
+    game_opponents = df_full[['game_id', 'home_team', 'away_team']].copy()
+
+    matchup = wr_for_matchup.merge(game_opponents, on='game_id', how='left')
+    matchup['opponent_team'] = matchup.apply(
+        lambda r: r['away_team'] if r['team'] == r['home_team'] else r['home_team'], axis=1)
+
+    matchup = matchup.merge(cb_for_matchup, on=['game_id', 'opponent_team'], how='left')
+    matchup['height_advantage'] = matchup['wr_height'] - matchup['cb_height']
+    matchup['weight_advantage'] = matchup['wr_weight'] - matchup['cb_weight']
+
+    matchup_final = matchup[['team', 'game_id', 'height_advantage', 'weight_advantage',
+                              'recent_def_completion_pct', 'recent_def_passer_rating_allowed']].rename(
+        columns={'recent_def_completion_pct': 'opp_cb_completion_pct_allowed',
+                 'recent_def_passer_rating_allowed': 'opp_cb_rating_allowed'})
+
+    # NOTE: merges on RAW home_team/away_team, not standardized - see docstring
+    home_matchup = matchup_final.rename(columns={
+        'team': 'home_team',
+        'height_advantage': 'home_wr_height_advantage',
+        'weight_advantage': 'home_wr_weight_advantage',
+        'opp_cb_completion_pct_allowed': 'home_opp_cb_completion_allowed',
+        'opp_cb_rating_allowed': 'home_opp_cb_rating_allowed'
+    })
+    away_matchup = matchup_final.rename(columns={
+        'team': 'away_team',
+        'height_advantage': 'away_wr_height_advantage',
+        'weight_advantage': 'away_wr_weight_advantage',
+        'opp_cb_completion_pct_allowed': 'away_opp_cb_completion_allowed',
+        'opp_cb_rating_allowed': 'away_opp_cb_rating_allowed'
+    })
+
+    df_full = df_full.drop(columns=[c for c in df_full.columns if
+                                     'wr_height_advantage' in c or 'wr_weight_advantage' in c or 'opp_cb' in c],
+                            errors='ignore')
+    df_full = df_full.merge(home_matchup, on=['game_id', 'home_team'], how='left')
+    df_full = df_full.merge(away_matchup, on=['game_id', 'away_team'], how='left')
+
+    return df_full
+
+def add_weather_features(df_full):
+    """
+    Adds weather-related features:
+    1) Raw temp/wind, with a neutral fill (70F, 0 wind) for dome/closed
+       games — this is the actual real condition for domes, not an
+       estimate, so it's distinct from mean-imputation.
+    2) Simple threshold flags for cold (<=32F) and high wind (>=15mph)
+       games, only ever flagged for genuinely outdoor games.
+    3) Climate shock: how much colder today's game is than the visiting
+       team's own typical home outdoor temperature, and a flag for
+       extreme cases (25+ degree swing) - e.g. a warm-climate team
+       traveling into unfamiliar cold. Real effect confirmed (61.6% vs
+       54.8% baseline home win rate in cold-shock games), though it did
+       not net a measurable overall accuracy improvement in testing -
+       kept for completeness/interpretability per deliberate choice.
+
+    Requires temp, wind, roof, home_team_std, away_team_std, home_win
+    already present in df_full.
+    """
+    df_full = df_full.copy()
+
+    df_full['is_outdoor'] = df_full['roof'].isin(['outdoors', 'open']).astype(int)
+    df_full['temp_adj'] = df_full['temp'].where(df_full['is_outdoor'] == 1, 70)
+    df_full['wind_adj'] = df_full['wind'].where(df_full['is_outdoor'] == 1, 0)
+
+    df_full['cold_game'] = ((df_full['is_outdoor'] == 1) & (df_full['temp_adj'] <= 32)).astype(int)
+    df_full['high_wind_game'] = ((df_full['is_outdoor'] == 1) & (df_full['wind_adj'] >= 15)).astype(int)
+
+    team_climate = df_full[df_full['is_outdoor'] == 1].groupby('home_team_std')['temp_adj'].mean()
+    df_full['away_home_climate'] = df_full['away_team_std'].map(team_climate)
+    df_full['away_home_climate'] = df_full['away_home_climate'].fillna(70)  # dome/no-data teams treated as neutral
+
+    df_full['climate_shock'] = None
+    outdoor_mask = df_full['is_outdoor'] == 1
+    df_full.loc[outdoor_mask, 'climate_shock'] = (
+        df_full.loc[outdoor_mask, 'away_home_climate'] - df_full.loc[outdoor_mask, 'temp_adj']
+    )
+    df_full['climate_shock'] = df_full['climate_shock'].fillna(0).astype(float)
+
+    df_full['cold_shock_game'] = ((df_full['climate_shock'] >= 25) & (df_full['is_outdoor'] == 1)).astype(int)
 
     return df_full
