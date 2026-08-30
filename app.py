@@ -18,7 +18,7 @@ def get_model():
     return load_model()
 
 
-@st.cache_data(ttl=3600 * 6)  # refresh every 6 hours - snapshots are expensive to rebuild
+@st.cache_data(ttl=3600 * 6)
 def get_snapshots():
     return build_snapshots()
 
@@ -30,10 +30,6 @@ def get_available_weeks():
     return sorted(upcoming['week'].unique().tolist())
 
 
-model_bundle = get_model()
-snapshots = get_snapshots()
-weeks = get_available_weeks()
-
 @st.cache_data(ttl=3600 * 24)
 def get_team_colors():
     teams = nfl.load_teams().to_pandas()
@@ -41,6 +37,10 @@ def get_team_colors():
 
 
 team_colors = get_team_colors()
+
+model_bundle = get_model()
+snapshots = get_snapshots()
+weeks = get_available_weeks()
 
 if not weeks:
     st.warning("No upcoming games found for the 2026 season.")
@@ -50,10 +50,31 @@ else:
     with st.spinner(f"Generating predictions for Week {selected_week}..."):
         predictions = predict_week(2026, selected_week, snapshots, model_bundle)
 
+    # Attach Vegas odds for display purposes only - not part of the model itself
+    def moneyline_to_prob(ml):
+        if pd.isna(ml):
+            return None
+        if ml < 0:
+            return -ml / (-ml + 100)
+        else:
+            return 100 / (ml + 100)
+
+    sched_odds = nfl.load_schedules(seasons=[2026]).to_pandas()
+    sched_odds = sched_odds[sched_odds['week'] == selected_week][
+        ['game_id', 'home_moneyline', 'away_moneyline']].copy()
+    sched_odds['vegas_home_prob'] = sched_odds['home_moneyline'].apply(moneyline_to_prob)
+    sched_odds['vegas_away_prob'] = sched_odds['vegas_home_prob'].apply(lambda x: 1 - x if x is not None else None)
+
+    predictions = predictions.merge(
+        sched_odds[['game_id', 'home_moneyline', 'away_moneyline', 'vegas_home_prob', 'vegas_away_prob']],
+        on='game_id', how='left'
+    )
+
     if predictions.empty:
         st.warning("No predictions available for this week.")
     else:
-         for _, game in predictions.iterrows():
+        # ============ DISPLAY BLOCK STARTS HERE ============
+        for _, game in predictions.iterrows():
             with st.container(border=True):
                 col1, col2, col3 = st.columns([2, 3, 2])
 
@@ -79,11 +100,33 @@ else:
                     st.caption(f"{game['away_team']} {away_pct:.0%} — {home_pct:.0%} {game['home_team']}")
                     st.markdown(f"Favorite: **{favorite}**")
 
+                    # Vegas comparison, if odds are already published for this game
+                    if pd.notna(game.get('vegas_home_prob')):
+                        vegas_away = game['vegas_away_prob']
+                        vegas_home = game['vegas_home_prob']
+
+                        def format_odds(ml):
+                            if pd.isna(ml):
+                                return ""
+                            ml = int(ml)
+                            return f"+{ml}" if ml > 0 else str(ml)
+
+                        away_odds = format_odds(game['away_moneyline'])
+                        home_odds = format_odds(game['home_moneyline'])
+
+                        diff = abs(home_pct - vegas_home)
+                        st.caption(f"🎰 Vegas: {game['away_team']} {vegas_away:.0%} ({away_odds}) — {vegas_home:.0%} ({home_odds}) {game['home_team']}")
+                        if diff >= 0.10:
+                            st.caption(f"⚠️ Model differs from Vegas by {diff:.0%}")
+                    else:
+                        st.caption("🎰 Vegas odds not yet published for this game")
+
                 with col3:
                     st.markdown(f"**{game['home_team']}**")
                     st.caption("Home")
 
                 st.caption(f"📅 {pd.to_datetime(game['gameday']).strftime('%a, %b %d, %Y')}")
+        # ============ DISPLAY BLOCK ENDS HERE ============
 
 st.divider()
 st.caption(

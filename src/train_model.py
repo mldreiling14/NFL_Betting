@@ -34,6 +34,8 @@ FEATURE_COLS = [
     'home_wr_weight_advantage', 'away_wr_weight_advantage',
     'home_opp_cb_completion_allowed', 'away_opp_cb_completion_allowed',
     'home_opp_cb_rating_allowed', 'away_opp_cb_rating_allowed',
+    'home_star_rb_injured', 'away_star_rb_injured',
+    'home_star_wr_injured', 'away_star_wr_injured',
     'div_game'
 ]
 

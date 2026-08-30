@@ -14,7 +14,9 @@ from features import (
     add_rest_advantage,
     add_oline_features,
     add_db_wr_matchup_features,
-    add_weather_features
+    add_weather_features,
+    add_star_rb_injury_feature,
+    add_star_wr_injury_feature
 )
 
 
@@ -87,7 +89,8 @@ def build_all_features(seasons=range(2015, 2026), db_path="data/nfl.db"):
     df_full = add_oline_features(df_full, oline_team_stats, pressure_stats)
     df_full = add_db_wr_matchup_features(df_full, player_stats, snaps_full, crosswalk, physical, adv_def_full)
     df_full = add_weather_features(df_full)
-    # Save the finished, feature-complete table
+    df_full = add_star_rb_injury_feature(df_full, player_stats, snaps_full, crosswalk, injuries)
+    df_full = add_star_wr_injury_feature(df_full, player_stats, snaps_full, crosswalk, injuries)
     conn = sqlite3.connect(db_path)
     df_full.to_sql("games_with_features", conn, if_exists="replace", index=False)
     conn.close()

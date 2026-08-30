@@ -79,16 +79,26 @@ def build_snapshots(db_path="data/nfl.db", seasons=range(2015, 2026)):
         elo[team] = elo[team] * (1 - revert_fraction) + 1500 * revert_fraction
     current_elo = pd.DataFrame(list(elo.items()), columns=['team', 'current_elo'])
 
-    # --- QB ---
+    # --- QB (depth-chart based - fixes the "emergency backup finished the season" problem,
+    # e.g. KC's Mahomes injury being masked by Oladokun's poor stats under the old method) ---
+    depth = nfl.load_depth_charts(seasons=[max(seasons)]).to_pandas()
+    qb_depth = depth[(depth['pos_abb'] == 'QB') & (depth['pos_rank'] == 1)].copy()
+    qb_depth['dt'] = pd.to_datetime(qb_depth['dt'])
+    current_qb_starter = qb_depth.loc[qb_depth.groupby('team')['dt'].idxmax()][['team', 'gsis_id']].rename(
+        columns={'gsis_id': 'player_id'})
+
     qb_stats = player_stats[(player_stats['position'] == 'QB') & (player_stats['attempts'] > 0)].copy()
-    qb_stats = qb_stats[['player_id', 'game_id', 'team', 'passing_yards', 'passing_tds',
+    qb_stats = qb_stats[['player_id', 'game_id', 'passing_yards', 'passing_tds',
                          'passing_interceptions', 'passing_epa']]
-    qb_stats = qb_stats.merge(game_dates, on='game_id', how='left').sort_values(['team', 'gameday']).reset_index(drop=True)
+    qb_stats = qb_stats.merge(game_dates, on='game_id', how='left').sort_values(['player_id', 'gameday']).reset_index(drop=True)
     for col in ['passing_yards', 'passing_tds', 'passing_interceptions', 'passing_epa']:
         qb_stats[f'recent_{col}'] = qb_stats.groupby('player_id')[col].transform(
             lambda x: x.rolling(window=5, min_periods=1).mean())
-    current_qb = qb_stats.loc[qb_stats.groupby('team')['gameday'].idxmax()][
-        ['team', 'recent_passing_yards', 'recent_passing_tds', 'recent_passing_interceptions', 'recent_passing_epa']]
+
+    each_qb_current = qb_stats.loc[qb_stats.groupby('player_id')['gameday'].idxmax()][
+        ['player_id', 'recent_passing_yards', 'recent_passing_tds', 'recent_passing_interceptions', 'recent_passing_epa']]
+
+    current_qb = current_qb_starter.merge(each_qb_current, on='player_id', how='left')
 
     # --- RB (aggregate to team-game BEFORE rolling - see bug history) ---
     rb_stats = player_stats[player_stats['position'] == 'RB'].copy()
@@ -111,6 +121,14 @@ def build_snapshots(db_path="data/nfl.db", seasons=range(2015, 2026)):
             lambda x: x.rolling(window=5, min_periods=1).mean())
     current_rb = rb_team_game.loc[rb_team_game.groupby('team')['gameday'].idxmax()][
         ['team', 'recent_t_rush_yards', 'recent_t_rush_epa', 'recent_t_rec_yards']]
+
+    # --- Primary RB by depth chart (for star-injury detection specifically -
+    # NOT used for the team-aggregate rolling RB stats above, which correctly
+    # remain a whole-backfield sum and don't need this fix) ---
+    rb_depth = depth[(depth['pos_abb'] == 'RB') & (depth['pos_rank'] == 1)].copy()
+    rb_depth['dt'] = pd.to_datetime(rb_depth['dt'])
+    current_rb_starter = rb_depth.loc[rb_depth.groupby('team')['dt'].idxmax()][['team', 'gsis_id']].rename(
+        columns={'gsis_id': 'player_id'})
 
     # --- WR/TE (aggregate to team-game BEFORE rolling) ---
     wrte_stats = player_stats[player_stats['position'].isin(['WR', 'TE'])].copy()
@@ -166,30 +184,38 @@ def build_snapshots(db_path="data/nfl.db", seasons=range(2015, 2026)):
         lambda x: x.rolling(window=5, min_periods=1).mean())
     current_pressure = press.loc[press.groupby('team')['gameday'].idxmax()][['team', 'recent_pressure_pct']]
 
-    # --- Primary WR (current roster's top by own recent snap share) ---
-    wr = player_stats[player_stats['position'] == 'WR'][['player_id', 'game_id', 'team']].copy()
-    wr = wr.merge(crosswalk, on='player_id', how='left')
-    wr = wr.merge(snaps_full[snaps_full['position'] == 'WR'][['pfr_player_id', 'game_id', 'offense_pct']],
-                  on=['pfr_player_id', 'game_id'], how='left')
-    wr = wr.merge(game_dates, on='game_id', how='left').sort_values(['player_id', 'gameday']).reset_index(drop=True)
-    wr['offense_pct'] = wr.groupby('player_id')['offense_pct'].ffill()
-    wr['recent_offense_pct'] = wr.groupby('player_id')['offense_pct'].transform(
-        lambda x: x.rolling(window=5, min_periods=1).mean())
-    each_wr = wr.loc[wr.groupby('player_id')['gameday'].idxmax()][['player_id', 'pfr_player_id', 'team', 'recent_offense_pct']]
-    current_primary_wr = each_wr.loc[each_wr.groupby('team')['recent_offense_pct'].idxmax()][['team', 'pfr_player_id']]
-    current_primary_wr = current_primary_wr.merge(physical, on='pfr_player_id', how='left')
+    # --- Primary WR (depth-chart based - same fix rationale as QB) ---
+    wr_depth = depth[(depth['pos_abb'] == 'WR') & (depth['pos_rank'] == 1)].copy()
+    wr_depth['dt'] = pd.to_datetime(wr_depth['dt'])
+    current_wr_starter = wr_depth.loc[wr_depth.groupby('team')['dt'].idxmax()][['team', 'gsis_id']].rename(
+        columns={'gsis_id': 'player_id'})
+    current_wr_starter = current_wr_starter.merge(crosswalk, on='player_id', how='left')
+    current_primary_wr = current_wr_starter[['team', 'pfr_player_id']].merge(physical, on='pfr_player_id', how='left')
 
-    # --- Primary CB (INNER merge - critical bug fix, see docstring history in features.py) ---
-    cb_only = snaps_full[snaps_full['position'] == 'CB'][['pfr_player_id', 'game_id', 'defense_pct']]
-    cb = adv_def_full.merge(cb_only, on=['pfr_player_id', 'game_id'], how='inner')
-    cb = cb.merge(game_dates, on='game_id', how='left').sort_values(['pfr_player_id', 'gameday']).reset_index(drop=True)
-    for col in ['defense_pct', 'def_completion_pct', 'def_passer_rating_allowed']:
-        cb[f'recent_{col}'] = cb.groupby('pfr_player_id')[col].transform(
+    # --- Primary CB (depth-chart based: both LCB1 and RCB1, pick whichever has better
+    # recent coverage stats - unlike QB/WR, there's no single "CB1" in the depth chart) ---
+    cb_depth = depth[(depth['pos_abb'].isin(['LCB', 'RCB'])) & (depth['pos_rank'] == 1)].copy()
+    cb_depth['dt'] = pd.to_datetime(cb_depth['dt'])
+    current_cb_starters = cb_depth.loc[cb_depth.groupby(['team', 'pos_abb'])['dt'].idxmax()][
+        ['team', 'gsis_id', 'pos_abb']].rename(columns={'gsis_id': 'player_id'})
+    current_cb_starters = current_cb_starters.merge(crosswalk, on='player_id', how='left')
+
+    # Each starter's own rolling coverage stats
+    cb_stats_all = adv_def_full[['game_id', 'pfr_player_id', 'def_completion_pct', 'def_passer_rating_allowed']].copy()
+    cb_stats_all = cb_stats_all.merge(game_dates, on='game_id', how='left').sort_values(
+        ['pfr_player_id', 'gameday']).reset_index(drop=True)
+    for col in ['def_completion_pct', 'def_passer_rating_allowed']:
+        cb_stats_all[f'recent_{col}'] = cb_stats_all.groupby('pfr_player_id')[col].transform(
             lambda x: x.rolling(window=5, min_periods=1).mean())
-    each_cb = cb.loc[cb.groupby('pfr_player_id')['gameday'].idxmax()][
-        ['team', 'pfr_player_id', 'recent_defense_pct', 'recent_def_completion_pct', 'recent_def_passer_rating_allowed']]
-    current_primary_cb = each_cb.loc[each_cb.groupby('team')['recent_defense_pct'].idxmax()][
-        ['team', 'pfr_player_id', 'recent_def_completion_pct', 'recent_def_passer_rating_allowed']]
+    each_cb_current = cb_stats_all.loc[cb_stats_all.groupby('pfr_player_id')['gameday'].idxmax()][
+        ['pfr_player_id', 'recent_def_completion_pct', 'recent_def_passer_rating_allowed']]
+
+    current_cb_starters = current_cb_starters.merge(each_cb_current, on='pfr_player_id', how='left')
+
+    # Pick whichever of the two (LCB1/RCB1) has the LOWER completion % allowed (better coverage)
+    current_primary_cb = current_cb_starters.loc[
+        current_cb_starters.groupby('team')['recent_def_completion_pct'].idxmin()
+    ][['team', 'pfr_player_id', 'recent_def_completion_pct', 'recent_def_passer_rating_allowed']]
     current_primary_cb = current_primary_cb.merge(physical, on='pfr_player_id', how='left')
 
     return {
@@ -198,6 +224,7 @@ def build_snapshots(db_path="data/nfl.db", seasons=range(2015, 2026)):
         'current_elo': current_elo,
         'current_qb': current_qb,
         'current_rb': current_rb,
+        'current_rb_starter': current_rb_starter,
         'current_wrte': current_wrte,
         'current_coach': current_coach,
         'current_team_stats': current_team_stats,
@@ -251,6 +278,8 @@ def build_matchup_features(home_team, away_team, snapshots, home_rest, away_rest
         row[f'{side}_qb_injury_flag'] = 0
         row[f'{side}_rb_injury_flag'] = 0
         row[f'{side}_wrte_injury_flag'] = 0
+        row[f'{side}_star_rb_injured'] = 0
+        row[f'{side}_star_wr_injured'] = 0
 
         ts = s['current_team_stats'][s['current_team_stats']['team'] == team]
         row[f'{side}_epa_allowed_recent'] = ts['recent_epa_allowed'].values[0]
@@ -296,6 +325,18 @@ def predict_matchup(home_team, away_team, snapshots, model_bundle, home_rest, aw
     X = feature_row[feature_cols]
     X_imputed = pd.DataFrame(model_bundle['imputer'].transform(X), columns=feature_cols)
     return model_bundle['model'].predict_proba(X_imputed)[0][1]
+
+
+def moneyline_to_prob(ml):
+    """Converts American moneyline odds to implied win probability. Not de-vigged -
+    the two sides' implied probabilities will sum to slightly over 100%, reflecting
+    the sportsbook's built-in margin."""
+    if pd.isna(ml):
+        return None
+    if ml < 0:
+        return -ml / (-ml + 100)
+    else:
+        return 100 / (ml + 100)
 
 
 def predict_week(season, week, snapshots, model_bundle):

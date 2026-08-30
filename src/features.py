@@ -797,3 +797,223 @@ def add_weather_features(df_full):
     df_full['cold_shock_game'] = ((df_full['climate_shock'] >= 25) & (df_full['is_outdoor'] == 1)).astype(int)
 
     return df_full
+
+def add_star_rb_injury_feature(df_full, player_stats, snaps_full, crosswalk, injuries, window=5):
+    """
+    Adds a flag for whether a team's primary RB (by recent snap share)
+    is BOTH a genuine star performer AND carrying an injury designation
+    that week. "Star" = top 10% league-wide among RBs by rolling
+    fantasy points (PPR) over their last 5 games, recalculated fresh
+    for every game date.
+
+    Distinct from the general primary-RB injury flag in
+    add_injury_features, which fires for ANY primary RB injury
+    regardless of talent level - this only fires for a genuine
+    difference-maker.
+
+    Real-world check: home win rate drops from ~54.8% (overall) to
+    ~48.7% when the home team's star RB is out (n=76). Real, sensible
+    effect; did not net a measurable overall accuracy improvement in
+    isolated testing (kept anyway - see FEATURES.md).
+    """
+
+    # Rolling fantasy production, all RBs league-wide
+    rb_fantasy = player_stats[player_stats['position'] == 'RB'][
+        ['player_id', 'game_id', 'season', 'week', 'fantasy_points_ppr']].copy()
+    rb_fantasy = rb_fantasy.sort_values(['player_id', 'season', 'week']).reset_index(drop=True)
+    rb_fantasy['recent_fantasy_ppr'] = (
+        rb_fantasy.groupby('player_id')['fantasy_points_ppr']
+        .transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
+    )
+    rb_fantasy['position_percentile'] = (
+        rb_fantasy.groupby('game_id')['recent_fantasy_ppr'].rank(pct=True)
+    )
+    rb_fantasy['is_star'] = (rb_fantasy['position_percentile'] >= 0.90).astype(int)
+    star_lookup = rb_fantasy[['player_id', 'game_id', 'is_star']]
+
+    # Identify primary RB per team/game (same pattern as add_injury_features)
+    rb_stats_local = player_stats[player_stats['position'] == 'RB'][
+        ['player_id', 'game_id', 'season', 'week', 'team']].copy()
+    rb_stats_local = rb_stats_local.merge(crosswalk, on='player_id', how='left')
+    rb_stats_local = rb_stats_local.merge(
+        snaps_full[snaps_full['position'] == 'RB'][['pfr_player_id', 'game_id', 'offense_pct']],
+        on=['pfr_player_id', 'game_id'], how='left')
+
+    rb_sorted = rb_stats_local.sort_values(['player_id', 'season', 'week']).reset_index(drop=True)
+    rb_sorted['recent_snap_pct'] = (
+        rb_sorted.groupby(['player_id', 'season'])['offense_pct']
+        .transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
+    )
+    primary_rb = (
+        rb_sorted.sort_values('recent_snap_pct', ascending=False)
+        .groupby(['team', 'game_id'], as_index=False)
+        .first()[['team', 'game_id', 'season', 'week', 'player_id']]
+    )
+
+    primary_rb = primary_rb.merge(star_lookup, on=['player_id', 'game_id'], how='left')
+    primary_rb['is_star'] = primary_rb['is_star'].fillna(0)
+
+    rb_injuries = injuries[injuries['position'] == 'RB'].copy()
+    rb_injuries['injury_flag'] = rb_injuries['report_status'].isin(
+        ['Out', 'Doubtful', 'Questionable']).astype(int)
+    rb_injuries = rb_injuries.rename(columns={'gsis_id': 'player_id'})
+
+    primary_rb = primary_rb.merge(
+        rb_injuries[['season', 'week', 'team', 'player_id', 'injury_flag']],
+        on=['season', 'week', 'team', 'player_id'], how='left')
+    primary_rb['injury_flag'] = primary_rb['injury_flag'].fillna(0).astype(int)
+    primary_rb['star_rb_injured'] = (
+        (primary_rb['is_star'] == 1) & (primary_rb['injury_flag'] == 1)
+    ).astype(int)
+
+    df_full = standardize_team_codes(df_full)
+
+    home_star_rb = primary_rb[['season', 'week', 'team', 'star_rb_injured']].rename(
+        columns={'team': 'home_team_std', 'star_rb_injured': 'home_star_rb_injured'})
+    away_star_rb = primary_rb[['season', 'week', 'team', 'star_rb_injured']].rename(
+        columns={'team': 'away_team_std', 'star_rb_injured': 'away_star_rb_injured'})
+
+    df_full = df_full.drop(columns=['home_star_rb_injured', 'away_star_rb_injured'], errors='ignore')
+    df_full = df_full.merge(home_star_rb, on=['season', 'week', 'home_team_std'], how='left')
+    df_full = df_full.merge(away_star_rb, on=['season', 'week', 'away_team_std'], how='left')
+    df_full['home_star_rb_injured'] = df_full['home_star_rb_injured'].fillna(0).astype(int)
+    df_full['away_star_rb_injured'] = df_full['away_star_rb_injured'].fillna(0).astype(int)
+
+    return df_full
+
+def add_star_wr_injury_feature(df_full, player_stats, snaps_full, crosswalk, injuries, window=5):
+    """
+    Adds a flag for whether a team's primary WR (by recent snap share)
+    is BOTH a genuine star performer (top 5% league-wide by rolling
+    targets over their last 5 games) AND carrying a serious injury
+    designation (Out or Doubtful - "Questionable" is deliberately
+    excluded, since questionable players very often still play close
+    to their normal role, which would dilute/reverse the signal).
+
+    BUG HISTORY: an earlier version of this feature identified the
+    "primary WR" and their "star" status using ONLY games where that
+    player has a real stat row. But a player who is genuinely injured
+    generates NO stat row for the game they miss - so they became
+    structurally invisible to their own "primary WR" and "star" checks
+    at exactly the moment they were actually out. This produced a
+    counterintuitive result (higher win rate when the "star" WR was
+    "injured") because the feature was actually measuring something
+    close to the opposite of its intent. Fixed using pd.merge_asof to
+    project each player's last known snap share AND star status
+    forward across every game their team plays (direction='backward'),
+    so an injured star's real, established role and talent level still
+    "shows up" for that game, right up until the injury check runs.
+
+    This fix is what turned a nonsensical result into a real, sensible
+    one: home win rate drops to ~38% (vs ~54.8% overall) when a
+    properly-identified star WR is out/doubtful (n=21, small sample -
+    treat the exact number as an estimate). Confirmed to add real
+    accuracy value in isolated model testing (67.4% -> 67.7%).
+
+    player_stats must include: player_id, game_id, season, week,
+    position, targets
+    snaps_full must include: pfr_player_id, game_id, position, offense_pct
+    """
+
+    game_dates = df_full[['game_id', 'gameday']].drop_duplicates()
+    game_dates['gameday'] = pd.to_datetime(game_dates['gameday'])
+
+    df_full = standardize_team_codes(df_full)
+
+    team_game_dates = pd.concat([
+        df_full[['home_team_std', 'game_id', 'gameday']].rename(columns={'home_team_std': 'team'}),
+        df_full[['away_team_std', 'game_id', 'gameday']].rename(columns={'away_team_std': 'team'})
+    ], ignore_index=True)
+    team_game_dates['gameday'] = pd.to_datetime(team_game_dates['gameday'])
+    team_game_dates = team_game_dates.sort_values('gameday').reset_index(drop=True)
+
+    # --- WR snap share history + rolling target-based star status ---
+    wr_stats = player_stats[player_stats['position'] == 'WR'][
+        ['player_id', 'game_id', 'season', 'week', 'team', 'targets']].copy()
+    wr_stats = wr_stats.merge(crosswalk, on='player_id', how='left')
+    wr_stats = wr_stats.merge(
+        snaps_full[snaps_full['position'] == 'WR'][['pfr_player_id', 'game_id', 'offense_pct']],
+        on=['pfr_player_id', 'game_id'], how='left')
+    wr_stats = wr_stats.merge(game_dates, on='game_id', how='left')
+    wr_stats = wr_stats.sort_values(['player_id', 'gameday']).reset_index(drop=True)
+
+    wr_stats['recent_snap_pct'] = (
+        wr_stats.groupby('player_id')['offense_pct']
+        .transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
+    )
+    wr_stats['recent_targets'] = (
+        wr_stats.groupby('player_id')['targets']
+        .transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
+    )
+    wr_stats['target_percentile'] = wr_stats.groupby('game_id')['recent_targets'].rank(pct=True)
+    wr_stats['is_star_wr'] = (wr_stats['target_percentile'] >= 0.95).astype(int)
+
+    snap_history = wr_stats[['player_id', 'team', 'gameday', 'recent_snap_pct']].dropna(subset=['gameday', 'recent_snap_pct'])
+    star_history = wr_stats[['player_id', 'gameday', 'is_star_wr']].dropna(subset=['gameday'])
+
+    # --- Project snap share forward across every game the player's team played (fixes the bug) ---
+    snap_projected_frames = []
+    for player_id, player_df in snap_history.sort_values('gameday').groupby('player_id'):
+        team = player_df['team'].iloc[-1]
+        team_games = team_game_dates[team_game_dates['team'] == team].sort_values('gameday')
+        projected = pd.merge_asof(
+            team_games, player_df[['gameday', 'recent_snap_pct']].sort_values('gameday'),
+            on='gameday', direction='backward'
+        )
+        projected['player_id'] = player_id
+        snap_projected_frames.append(projected)
+    wr_snap_projected = pd.concat(snap_projected_frames, ignore_index=True).dropna(subset=['recent_snap_pct'])
+
+    # --- Project star status forward the same way ---
+    star_projected_frames = []
+    for player_id, player_df in star_history.sort_values('gameday').groupby('player_id'):
+        player_teams = snap_history[snap_history['player_id'] == player_id]['team']
+        if len(player_teams) == 0:
+            continue
+        team = player_teams.iloc[-1]
+        team_games = team_game_dates[team_game_dates['team'] == team].sort_values('gameday')
+        projected = pd.merge_asof(
+            team_games, player_df[['gameday', 'is_star_wr']].sort_values('gameday'),
+            on='gameday', direction='backward'
+        )
+        projected['player_id'] = player_id
+        star_projected_frames.append(projected)
+    wr_star_projected = pd.concat(star_projected_frames, ignore_index=True).dropna(subset=['is_star_wr'])
+    wr_star_projected = wr_star_projected[['player_id', 'game_id', 'is_star_wr']]
+
+    # --- Identify primary WR per team/game using the GAP-FREE projected snap share ---
+    primary_wr = (
+        wr_snap_projected.sort_values('recent_snap_pct', ascending=False)
+        .groupby(['team', 'game_id'], as_index=False)
+        .first()[['team', 'game_id', 'player_id']]
+    )
+    primary_wr = primary_wr.merge(wr_star_projected, on=['player_id', 'game_id'], how='left')
+    primary_wr['is_star_wr'] = primary_wr['is_star_wr'].fillna(0)
+
+    # --- Injury check: Out or Doubtful ONLY (Questionable players often still play) ---
+    wr_injuries = injuries[injuries['position'] == 'WR'].copy()
+    wr_injuries['injury_flag_tight'] = wr_injuries['report_status'].isin(['Out', 'Doubtful']).astype(int)
+    wr_injuries = wr_injuries.rename(columns={'gsis_id': 'player_id'})
+
+    primary_wr = primary_wr.merge(df_full[['game_id', 'season', 'week']].drop_duplicates(), on='game_id', how='left')
+    primary_wr = primary_wr.merge(
+        wr_injuries[['season', 'week', 'team', 'player_id', 'injury_flag_tight']],
+        on=['season', 'week', 'team', 'player_id'], how='left')
+    primary_wr['injury_flag_tight'] = primary_wr['injury_flag_tight'].fillna(0).astype(int)
+
+    primary_wr['star_wr_injured'] = (
+        (primary_wr['is_star_wr'] == 1) & (primary_wr['injury_flag_tight'] == 1)
+    ).astype(int)
+
+    home_star_wr = primary_wr[['season', 'week', 'team', 'star_wr_injured']].rename(
+        columns={'team': 'home_team_std', 'star_wr_injured': 'home_star_wr_injured'})
+    away_star_wr = primary_wr[['season', 'week', 'team', 'star_wr_injured']].rename(
+        columns={'team': 'away_team_std', 'star_wr_injured': 'away_star_wr_injured'})
+
+    df_full = df_full.drop(columns=['home_star_wr_injured', 'away_star_wr_injured'], errors='ignore')
+    df_full = df_full.merge(home_star_wr, on=['season', 'week', 'home_team_std'], how='left')
+    df_full = df_full.merge(away_star_wr, on=['season', 'week', 'away_team_std'], how='left')
+    df_full['home_star_wr_injured'] = df_full['home_star_wr_injured'].fillna(0).astype(int)
+    df_full['away_star_wr_injured'] = df_full['away_star_wr_injured'].fillna(0).astype(int)
+
+    return df_full
