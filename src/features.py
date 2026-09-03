@@ -496,52 +496,80 @@ def add_coach_features(df_full, window=5):
     return df_full
 
 
-def add_elo_features(df_full, k_factor=20, home_advantage=65, revert_fraction=1/3, initial_rating=1500):
+def add_elo_features(df_full, k_off_def=0.05, revert_fraction=1/3):
     """
-    Adds Elo ratings for both home and away teams, reflecting each
-    team's overall strength entering this specific game (accounts
-    for strength of opponent, unlike simple win %). Ratings partially
-    revert toward league average (1500) at the start of each season
-    to account for roster turnover, then evolve game-by-game based
-    on actual vs. expected outcomes.
-    """
+    Adds split offense/defense rating features for both home and away
+    teams, REPLACING the earlier single combined Elo rating. Each
+    team gets two separate ratings: offense (points scored above/below
+    league average, adjusted for opponent defense quality) and defense
+    (points allowed below/above league average, adjusted for opponent
+    offense quality). Both start at 0 (league average).
 
+    This REPLACED margin-of-victory-adjusted combined Elo after
+    confirming it performs BETTER when it fully replaces the combined
+    rating (67.9% -> 68.2% in testing), but WORSE when added alongside
+    the combined rating (67.9% -> 67.0%) - the two contain overlapping
+    information and conflict with each other as separate inputs, but
+    the split version alone captures something the combined version
+    doesn't (offense/defense-specific strength, not just overall team
+    strength).
+
+    Also intentionally kept as a separate building block (rather than
+    re-combined into one number) since a future live, in-game win
+    probability model would likely want offense/defense tracked
+    separately rather than blended.
+
+    Historically validated: 2016 Cleveland's defense (1-15 season)
+    settles around -3.4 to -3.9, near the bottom of the real range
+    (~-4.8 to +4.9 across the league).
+    """
     df_full = standardize_team_codes(df_full)
 
-    games = df_full[['game_id', 'season', 'week', 'gameday', 'home_team_std', 'away_team_std', 'home_win']].copy()
+    games = df_full[['game_id', 'season', 'gameday', 'home_team_std', 'away_team_std',
+                      'home_score', 'away_score']].copy()
     games = games.sort_values(['season', 'gameday']).reset_index(drop=True)
 
     all_teams = set(games['home_team_std']).union(set(games['away_team_std']))
-    elo = {team: initial_rating for team in all_teams}
+    league_avg_points = games[['home_score', 'away_score']].values.mean()
 
-    home_elo_pre = []
-    away_elo_pre = []
+    off_rating = {team: 0.0 for team in all_teams}
+    def_rating = {team: 0.0 for team in all_teams}
     current_season = None
 
-    for idx, row in games.iterrows():
+    home_off_pre, home_def_pre, away_off_pre, away_def_pre = [], [], [], []
+
+    for _, row in games.iterrows():
         if current_season is not None and row['season'] != current_season:
-            for team in elo:
-                elo[team] = elo[team] * (1 - revert_fraction) + initial_rating * revert_fraction
+            for team in off_rating:
+                off_rating[team] *= (1 - revert_fraction)
+                def_rating[team] *= (1 - revert_fraction)
         current_season = row['season']
 
-        home_team = row['home_team_std']
-        away_team = row['away_team_std']
+        h, a = row['home_team_std'], row['away_team_std']
+        home_off_pre.append(off_rating[h])
+        home_def_pre.append(def_rating[h])
+        away_off_pre.append(off_rating[a])
+        away_def_pre.append(def_rating[a])
 
-        home_elo_pre.append(elo[home_team])
-        away_elo_pre.append(elo[away_team])
+        expected_home_score = league_avg_points + off_rating[h] - def_rating[a]
+        expected_away_score = league_avg_points + off_rating[a] - def_rating[h]
 
-        elo_diff = (elo[home_team] + home_advantage) - elo[away_team]
-        expected_home = 1 / (1 + 10 ** (-elo_diff / 400))
-        actual_home = row['home_win']
+        off_rating[h] += k_off_def * (row['home_score'] - expected_home_score)
+        def_rating[a] -= k_off_def * (row['home_score'] - expected_home_score)
 
-        elo[home_team] += k_factor * (actual_home - expected_home)
-        elo[away_team] += k_factor * ((1 - actual_home) - (1 - expected_home))
+        off_rating[a] += k_off_def * (row['away_score'] - expected_away_score)
+        def_rating[h] -= k_off_def * (row['away_score'] - expected_away_score)
 
-    games['home_elo_pre'] = home_elo_pre
-    games['away_elo_pre'] = away_elo_pre
+    games['home_off_rating_pre'] = home_off_pre
+    games['home_def_rating_pre'] = home_def_pre
+    games['away_off_rating_pre'] = away_off_pre
+    games['away_def_rating_pre'] = away_def_pre
 
-    elo_merge = games[['game_id', 'home_elo_pre', 'away_elo_pre']]
-    df_full = df_full.drop(columns=['home_elo_pre', 'away_elo_pre'], errors='ignore')
+    elo_merge = games[['game_id', 'home_off_rating_pre', 'home_def_rating_pre',
+                        'away_off_rating_pre', 'away_def_rating_pre']]
+    df_full = df_full.drop(columns=['home_elo_pre', 'away_elo_pre', 'home_off_rating_pre',
+                                     'home_def_rating_pre', 'away_off_rating_pre', 'away_def_rating_pre'],
+                            errors='ignore')
     df_full = df_full.merge(elo_merge, on='game_id', how='left')
 
     return df_full

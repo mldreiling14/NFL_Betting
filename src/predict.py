@@ -2,6 +2,7 @@ import pandas as pd
 import sqlite3
 import joblib
 import nflreadpy as nfl
+import numpy as np
 
 
 def load_model(model_path="models/win_probability_model.joblib"):
@@ -56,28 +57,44 @@ def build_snapshots(db_path="data/nfl.db", seasons=range(2015, 2026)):
         .reset_index().rename(columns={'win': 'current_recent_form', 'point_diff': 'current_recent_point_diff'})
     )
 
-    # --- Elo (full recompute, then apply season-boundary revert for the upcoming season) ---
-    elo_games = df_full[['game_id', 'season', 'gameday', 'home_team_std', 'away_team_std', 'home_win']].copy()
+    # --- Split offense/defense ratings (replaces combined Elo, matches add_elo_features) ---
+    elo_games = df_full[['game_id', 'season', 'gameday', 'home_team_std', 'away_team_std',
+                          'home_score', 'away_score']].copy()
     elo_games = elo_games.sort_values(['season', 'gameday']).reset_index(drop=True)
     all_teams = set(elo_games['home_team_std']).union(set(elo_games['away_team_std']))
-    elo = {team: 1500 for team in all_teams}
-    k_factor, home_advantage, revert_fraction = 20, 65, 1/3
+    league_avg_points = elo_games[['home_score', 'away_score']].values.mean()
+
+    off_rating = {team: 0.0 for team in all_teams}
+    def_rating = {team: 0.0 for team in all_teams}
+    k_off_def, revert_fraction = 0.05, 1/3
     current_season = None
+
     for _, row in elo_games.iterrows():
         if current_season is not None and row['season'] != current_season:
-            for team in elo:
-                elo[team] = elo[team] * (1 - revert_fraction) + 1500 * revert_fraction
+            for team in off_rating:
+                off_rating[team] *= (1 - revert_fraction)
+                def_rating[team] *= (1 - revert_fraction)
         current_season = row['season']
+
         h, a = row['home_team_std'], row['away_team_std']
-        elo_diff = (elo[h] + home_advantage) - elo[a]
-        expected_home = 1 / (1 + 10 ** (-elo_diff / 400))
-        actual_home = row['home_win']
-        elo[h] += k_factor * (actual_home - expected_home)
-        elo[a] += k_factor * ((1 - actual_home) - (1 - expected_home))
+        expected_home_score = league_avg_points + off_rating[h] - def_rating[a]
+        expected_away_score = league_avg_points + off_rating[a] - def_rating[h]
+
+        off_rating[h] += k_off_def * (row['home_score'] - expected_home_score)
+        def_rating[a] -= k_off_def * (row['home_score'] - expected_home_score)
+        off_rating[a] += k_off_def * (row['away_score'] - expected_away_score)
+        def_rating[h] -= k_off_def * (row['away_score'] - expected_away_score)
+
     # Apply one more revert for the upcoming season boundary
-    for team in elo:
-        elo[team] = elo[team] * (1 - revert_fraction) + 1500 * revert_fraction
-    current_elo = pd.DataFrame(list(elo.items()), columns=['team', 'current_elo'])
+    for team in off_rating:
+        off_rating[team] *= (1 - revert_fraction)
+        def_rating[team] *= (1 - revert_fraction)
+
+    current_off_def = pd.DataFrame({
+        'team': list(off_rating.keys()),
+        'current_off_rating': list(off_rating.values()),
+        'current_def_rating': [def_rating[t] for t in off_rating.keys()]
+    })
 
     # --- QB (depth-chart based - fixes the "emergency backup finished the season" problem,
     # e.g. KC's Mahomes injury being masked by Oladokun's poor stats under the old method) ---
@@ -221,7 +238,7 @@ def build_snapshots(db_path="data/nfl.db", seasons=range(2015, 2026)):
     return {
         'df_full': df_full,
         'current_form': current_form,
-        'current_elo': current_elo,
+        'current_off_def': current_off_def,
         'current_qb': current_qb,
         'current_rb': current_rb,
         'current_rb_starter': current_rb_starter,
@@ -294,9 +311,12 @@ def build_matchup_features(home_team, away_team, snapshots, home_rest, away_rest
     away_coach = s['current_coach'].loc[s['current_coach']['team'] == away_team, 'coach'].values[0]
     row['home_coach_h2h_wins'], row['h2h_games_played'] = _coach_h2h(s['df_full'], home_coach, away_coach)
 
-    row['home_elo_pre'] = s['current_elo'].loc[s['current_elo']['team'] == home_team, 'current_elo'].values[0]
-    row['away_elo_pre'] = s['current_elo'].loc[s['current_elo']['team'] == away_team, 'current_elo'].values[0]
-
+    home_od = s['current_off_def'][s['current_off_def']['team'] == home_team]
+    away_od = s['current_off_def'][s['current_off_def']['team'] == away_team]
+    row['home_off_rating_pre'] = home_od['current_off_rating'].values[0]
+    row['home_def_rating_pre'] = home_od['current_def_rating'].values[0]
+    row['away_off_rating_pre'] = away_od['current_off_rating'].values[0]
+    row['away_def_rating_pre'] = away_od['current_def_rating'].values[0]
     row['rest_advantage'] = home_rest - away_rest
 
     home_wr = s['current_primary_wr'][s['current_primary_wr']['team'] == home_team]
@@ -339,22 +359,47 @@ def moneyline_to_prob(ml):
         return 100 / (ml + 100)
 
 
+DETAIL_COLS = [
+    'home_recent_form', 'away_recent_form',
+    'home_off_rating_pre', 'home_def_rating_pre',
+    'away_off_rating_pre', 'away_def_rating_pre',
+    'home_coach_h2h_wins', 'h2h_games_played',
+    'home_qb_injury_flag', 'away_qb_injury_flag',
+    'home_rb_injury_flag', 'away_rb_injury_flag',
+    'home_wrte_injury_flag', 'away_wrte_injury_flag',
+    'home_star_rb_injured', 'away_star_rb_injured',
+    'home_star_wr_injured', 'away_star_wr_injured',
+    'rest_advantage'
+]
+
+
 def predict_week(season, week, snapshots, model_bundle):
-    """Returns a DataFrame of predictions for every game in a given season/week."""
+    """Returns a DataFrame of predictions for every game in a given season/week,
+    including the underlying feature values needed for a detailed game view."""
     sched = nfl.load_schedules(seasons=[season]).to_pandas()
     week_games = sched[sched['week'] == week]
 
     results = []
     for _, g in week_games.iterrows():
         try:
-            prob = predict_matchup(
-                g['home_team'], g['away_team'], snapshots, model_bundle,
+            feature_row = build_matchup_features(
+                g['home_team'], g['away_team'], snapshots,
                 g['home_rest'], g['away_rest'], g['div_game']
             )
-            results.append({
+            feature_cols = model_bundle['feature_cols']
+            X = feature_row[feature_cols]
+            X_imputed = pd.DataFrame(model_bundle['imputer'].transform(X), columns=feature_cols)
+            prob = model_bundle['model'].predict_proba(X_imputed)[0][1]
+
+            row_dict = {
                 'game_id': g['game_id'], 'home_team': g['home_team'], 'away_team': g['away_team'],
                 'gameday': g['gameday'], 'home_win_prob': prob, 'away_win_prob': 1 - prob
-            })
+            }
+            for col in DETAIL_COLS:
+                if col in feature_row.columns:
+                    row_dict[col] = feature_row[col].values[0]
+
+            results.append(row_dict)
         except (IndexError, KeyError) as e:
             print(f"Could not predict {g['game_id']}: missing data ({e})")
 
