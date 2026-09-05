@@ -108,6 +108,7 @@ def build_snapshots(db_path="data/nfl.db", seasons=range(2015, 2026)):
     qb_stats = qb_stats[['player_id', 'game_id', 'passing_yards', 'passing_tds',
                          'passing_interceptions', 'passing_epa']]
     qb_stats = qb_stats.merge(game_dates, on='game_id', how='left').sort_values(['player_id', 'gameday']).reset_index(drop=True)
+    qb_stats_raw = qb_stats.copy()  # keep the raw per-game stats for the game log, before rolling
     for col in ['passing_yards', 'passing_tds', 'passing_interceptions', 'passing_epa']:
         qb_stats[f'recent_{col}'] = qb_stats.groupby('player_id')[col].transform(
             lambda x: x.rolling(window=5, min_periods=1).mean())
@@ -235,6 +236,39 @@ def build_snapshots(db_path="data/nfl.db", seasons=range(2015, 2026)):
     ][['team', 'pfr_player_id', 'recent_def_completion_pct', 'recent_def_passer_rating_allowed']]
     current_primary_cb = current_primary_cb.merge(physical, on='pfr_player_id', how='left')
 
+    # --- Player display names, for the "key players" report ---
+    player_names = players[['gsis_id', 'display_name']].rename(columns={'gsis_id': 'player_id'})
+    player_names_pfr = players[['pfr_id', 'display_name']].rename(columns={'pfr_id': 'pfr_player_id'})
+
+    current_qb = current_qb.merge(player_names, on='player_id', how='left')
+    current_rb_starter = current_rb_starter.merge(player_names, on='player_id', how='left')
+    current_primary_wr = current_primary_wr.merge(player_names_pfr, on='pfr_player_id', how='left')
+    current_primary_cb = current_primary_cb.merge(player_names_pfr, on='pfr_player_id', how='left')
+
+    # --- Key defensive player: top pass rusher (top 10% league-wide by recent sacks+QB hits) ---
+    def_positions = ['DE', 'DT', 'DL', 'NT', 'LB', 'ILB', 'OLB', 'MLB', 'SLB', 'WLB']
+    pass_rush_stats = player_stats[player_stats['position'].isin(def_positions)][
+        ['player_id', 'game_id', 'team', 'def_sacks', 'def_qb_hits']].copy()
+    pass_rush_stats['pressure_score'] = pass_rush_stats['def_sacks'] + (pass_rush_stats['def_qb_hits'] * 0.5)
+    pass_rush_stats = pass_rush_stats.merge(game_dates, on='game_id', how='left')
+    pass_rush_stats = pass_rush_stats.sort_values(['player_id', 'gameday']).reset_index(drop=True)
+
+    pass_rush_stats['recent_pressure_score'] = (
+        pass_rush_stats.groupby('player_id')['pressure_score']
+        .transform(lambda x: x.rolling(window=5, min_periods=1).mean())
+    )
+
+    each_rusher_current = pass_rush_stats.loc[pass_rush_stats.groupby('player_id')['gameday'].idxmax()][
+        ['player_id', 'team', 'recent_pressure_score']]
+
+    threshold = each_rusher_current['recent_pressure_score'].quantile(0.90)
+    each_rusher_current['is_star_rusher'] = (each_rusher_current['recent_pressure_score'] >= threshold).astype(int)
+
+    current_pass_rusher = each_rusher_current.loc[
+        each_rusher_current.groupby('team')['recent_pressure_score'].idxmax()
+    ][['team', 'player_id', 'recent_pressure_score', 'is_star_rusher']]
+    current_pass_rusher = current_pass_rusher.merge(player_names, on='player_id', how='left')
+
     return {
         'df_full': df_full,
         'current_form': current_form,
@@ -248,8 +282,30 @@ def build_snapshots(db_path="data/nfl.db", seasons=range(2015, 2026)):
         'current_pressure': current_pressure,
         'current_primary_wr': current_primary_wr,
         'current_primary_cb': current_primary_cb,
+        'current_pass_rusher': current_pass_rusher,
+        'qb_stats_raw': qb_stats_raw,
     }
 
+def get_injury_report(team, season, week):
+    """
+    Attempts to pull real injury designations for a team for a specific
+    season/week. Returns None if the season isn't supported by the data
+    source at all yet (expected for a future season before real weekly
+    reports start being published), or a list of dicts (possibly empty)
+    if the season is supported but no relevant designations exist.
+    """
+    try:
+        injuries = nfl.load_injuries(seasons=[season]).to_pandas()
+    except ValueError:
+        return None
+
+    team_injuries = injuries[
+        (injuries['team'] == team) & (injuries['week'] == week) &
+        (injuries['report_status'].isin(['Out', 'Doubtful', 'Questionable']))
+    ]
+    if team_injuries.empty:
+        return []
+    return team_injuries[['full_name', 'position', 'report_status']].to_dict('records')
 
 def _coach_h2h(df_full, home_coach, away_coach):
     meetings = df_full[
@@ -358,6 +414,29 @@ def moneyline_to_prob(ml):
     else:
         return 100 / (ml + 100)
 
+def get_qb_game_log(player_id, qb_stats_raw, df_full, n=5):
+    """Returns a QB's last N individual games with real per-game passing stats."""
+    games = qb_stats_raw[qb_stats_raw['player_id'] == player_id].copy()
+    if games.empty:
+        return pd.DataFrame()
+
+    games = games.merge(
+        df_full[['game_id', 'season', 'week', 'home_team', 'away_team', 'home_qb_id', 'away_qb_id']],
+        on='game_id', how='left'
+    )
+    games['opponent'] = games.apply(
+        lambda r: r['away_team'] if r['player_id'] == r['home_qb_id'] else r['home_team'], axis=1
+    )
+
+    games = games.sort_values('gameday', ascending=False).head(n)
+    games = games.rename(columns={
+        'passing_yards': 'Yards', 'passing_tds': 'TD', 'passing_interceptions': 'INT', 'passing_epa': 'EPA'
+    })
+    games['EPA'] = games['EPA'].round(2)
+
+    return games[['season', 'week', 'opponent', 'Yards', 'TD', 'INT', 'EPA']].rename(
+        columns={'season': 'Season', 'week': 'Week', 'opponent': 'Opp'}
+    )
 
 DETAIL_COLS = [
     'home_recent_form', 'away_recent_form',
